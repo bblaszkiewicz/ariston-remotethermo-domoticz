@@ -58,6 +58,7 @@ class BasePlugin:
         
         if Parameters["Mode6"] == "Debug":
             Domoticz.Debugging(1)
+            Domoticz.Debug("Tryb debugowania włączony")
             
         if ariston is None:
             Domoticz.Error("Nie można zaimportować biblioteki aristonremotethermo!")
@@ -68,6 +69,9 @@ class BasePlugin:
         username = Parameters["Username"]
         password = Parameters["Password"]
         gateway_id = Parameters["Mode1"] if Parameters["Mode1"] else ""
+        
+        Domoticz.Debug(f"Username: {username}")
+        Domoticz.Debug(f"Gateway ID: {gateway_id if gateway_id else 'Auto-detect'}")
         
         try:
             self.runInterval = int(Parameters["Mode2"])
@@ -109,18 +113,24 @@ class BasePlugin:
                 'mode'
             ]
             
+            Domoticz.Log(f"Inicjalizacja handlera z interwałem {self.runInterval}s")
+            
             self.ariston_handler = ariston.AristonHandler(
                 username=username,
                 password=password,
                 sensors=sensors_list,
-                logging_level='INFO',
+                logging_level='DEBUG' if Parameters["Mode6"] == "Debug" else 'INFO',
                 period_get_request=self.runInterval,
                 gw=gateway_id
             )
             
+            Domoticz.Log("Handler utworzony, subskrybowanie callbacków...")
+            
             # Subskrybuj zmiany
             self.ariston_handler.subscribe_sensors(self.sensor_update_callback)
             self.ariston_handler.subscribe_statuses(self.status_update_callback)
+            
+            Domoticz.Log("Uruchamianie handlera...")
             
             # Uruchom handler
             self.ariston_handler.start()
@@ -128,6 +138,8 @@ class BasePlugin:
             
         except Exception as e:
             Domoticz.Error(f"Błąd podczas inicjalizacji handlera: {str(e)}")
+            import traceback
+            Domoticz.Error(f"Traceback: {traceback.format_exc()}")
             self.ariston_handler = None
 
     def onStop(self):
@@ -185,15 +197,30 @@ class BasePlugin:
     def onHeartbeat(self):
         self.heartbeat_counter += 1
         
-        # Co 10 cykli heartbeat sprawdź status
+        # Co 10 cykli heartbeat sprawdź status (100 sekund)
         if self.heartbeat_counter >= 10:
             self.heartbeat_counter = 0
             if self.ariston_handler:
                 try:
-                    if not self.ariston_handler.available:
+                    available = self.ariston_handler.available
+                    dhw_available = self.ariston_handler.dhw_available
+                    
+                    Domoticz.Debug(f"Status check - Available: {available}, DHW: {dhw_available}")
+                    
+                    if not available:
                         Domoticz.Error("Połączenie z Ariston niedostępne")
-                except:
-                    pass
+                        Domoticz.Debug(f"Plant ID: {self.ariston_handler.plant_id}")
+                        
+                        # Sprawdź czy są dane
+                        sensor_values = self.ariston_handler.sensor_values
+                        Domoticz.Debug(f"Liczba sensorów z danymi: {len([k for k,v in sensor_values.items() if v.get('value') is not None])}")
+                    else:
+                        Domoticz.Debug("Połączenie aktywne")
+                        
+                except Exception as e:
+                    Domoticz.Error(f"Błąd podczas sprawdzania statusu: {str(e)}")
+            else:
+                Domoticz.Error("Handler Ariston nie jest zainicjalizowany")
 
     def sensor_update_callback(self, changed_data, *args, **kwargs):
         """Callback wywoływany gdy zmieniają się wartości sensorów"""
