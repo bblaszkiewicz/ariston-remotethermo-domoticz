@@ -27,13 +27,34 @@
 import Domoticz
 import sys
 import os
+import logging
 
 # Dodaj ścieżkę do biblioteki ariston
 plugin_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(plugin_path)
 
+# Skonfiguruj logging dla biblioteki ariston aby przekierowywać do Domoticza
+class DomoticzLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            if record.levelno >= logging.ERROR:
+                Domoticz.Error(f"[Ariston] {msg}")
+            elif record.levelno >= logging.WARNING:
+                Domoticz.Log(f"[Ariston WARNING] {msg}")
+            elif record.levelno >= logging.INFO:
+                Domoticz.Log(f"[Ariston] {msg}")
+            else:
+                Domoticz.Debug(f"[Ariston] {msg}")
+        except:
+            pass
+
 try:
     from aristonremotethermo import ariston
+    # Dodaj handler do loggera biblioteki ariston
+    ariston_logger = logging.getLogger('aristonremotethermo.ariston')
+    ariston_logger.addHandler(DomoticzLogHandler())
+    ariston_logger.setLevel(logging.DEBUG)
 except ImportError:
     ariston = None
 
@@ -64,11 +85,23 @@ class BasePlugin:
             Domoticz.Error("Nie można zaimportować biblioteki aristonremotethermo!")
             Domoticz.Error("Upewnij się, że folder 'aristonremotethermo' znajduje się w katalogu pluginu")
             return
+        
+        # Sprawdź czy requests jest zainstalowany
+        try:
+            import requests
+            Domoticz.Debug(f"Moduł requests znaleziony: {requests.__version__}")
+        except ImportError:
+            Domoticz.Error("Brak modułu 'requests'! Zainstaluj: sudo pip3 install requests")
+            return
             
         # Pobierz parametry
         username = Parameters["Username"]
         password = Parameters["Password"]
         gateway_id = Parameters["Mode1"] if Parameters["Mode1"] else ""
+        
+        if not username or not password:
+            Domoticz.Error("Username i Password są wymagane!")
+            return
         
         Domoticz.Debug(f"Username: {username}")
         Domoticz.Debug(f"Gateway ID: {gateway_id if gateway_id else 'Auto-detect'}")
@@ -114,12 +147,16 @@ class BasePlugin:
             ]
             
             Domoticz.Log(f"Inicjalizacja handlera z interwałem {self.runInterval}s")
+            Domoticz.Log(f"Gateway ID: '{gateway_id}'")
+            
+            # Ustaw poziom logowania dla biblioteki ariston
+            log_level = 'DEBUG' if Parameters["Mode6"] == "Debug" else 'INFO'
             
             self.ariston_handler = ariston.AristonHandler(
                 username=username,
                 password=password,
                 sensors=sensors_list,
-                logging_level='DEBUG' if Parameters["Mode6"] == "Debug" else 'INFO',
+                logging_level=log_level,
                 period_get_request=self.runInterval,
                 gw=gateway_id
             )
@@ -134,7 +171,8 @@ class BasePlugin:
             
             # Uruchom handler
             self.ariston_handler.start()
-            Domoticz.Log("Handler Ariston został uruchomiony")
+            Domoticz.Log("Handler Ariston został uruchomiony - oczekiwanie na połączenie...")
+            Domoticz.Log("Pierwsze dane powinny pojawić się w ciągu 60 sekund")
             
         except Exception as e:
             Domoticz.Error(f"Błąd podczas inicjalizacji handlera: {str(e)}")
