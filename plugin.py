@@ -12,7 +12,7 @@
     <params>
         <param field="Username" label="Username (email)" width="200px" required="true"/>
         <param field="Password" label="Password" width="200px" required="true" password="true"/>
-        <param field="Mode1" label="Gateway ID" width="200px" required="false" default=""/>
+        <param field="Mode1" label="Gateway ID (hex format, np. 14335CF112FC)" width="200px" required="false" default=""/>
         <param field="Mode2" label="Update interval (seconds)" width="75px" required="true" default="60"/>
         <param field="Mode6" label="Debug" width="75px">
             <options>
