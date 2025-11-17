@@ -929,25 +929,34 @@ class AristonHandler:
                 json_data=login_data,
                 error_msg='Login'
             )
-
+    
             # Fetch plant IDs
             resp = self._request_get(
                 url=f'{self._ARISTON_URL}/api/v2/remote/plants/lite',
                 error_msg='Gateways'
             )
             gateways = [item['gwId'] for item in resp.json()]
+            
+            # ZMIENIONY KOD - jeśli podano Gateway ID ręcznie, użyj go bez walidacji
             if self._default_gw:
-                if self._default_gw not in gateways:
-                    self._LOGGER.error(f'Specified gateway {self._default_gw} not found in {gateways}')
-                    raise Exception(f'Specified gateway {self._default_gw} not found in {gateways}')
-                else:
-                    plant_id = self._default_gw
+                # Gateway ID podany ręcznie - użyj go bezpośrednio
+                plant_id = self._default_gw
+                self._LOGGER.info(f'Using manually specified gateway: {plant_id}')
+                
+                # Opcjonalnie: sprawdź czy gateway istnieje, ale nie przerywaj jeśli nie
+                if gateways and plant_id not in gateways:
+                    self._LOGGER.warning(f'Specified gateway {plant_id} not in auto-detected list {gateways}')
+                    self._LOGGER.warning(f'Attempting to use it anyway...')
             else:
+                # Gateway ID nie podany - wykryj automatycznie
                 if len(gateways) == 0:
                     self._LOGGER.error(f'At least one gateway is expected to be found')
                     raise Exception(f'At least one gateway is expected to be found')
                 # Use first plant plant id
                 plant_id = gateways[0]
+                self._LOGGER.info(f'Auto-detected gateway: {plant_id}')
+            
+            # Pobierz features dla wybranego gateway
             resp = self._request_get(
                 url=f'{self._ARISTON_URL}/api/v2/remote/plants/{plant_id}/features?eagerMode=True',
                 error_msg='Features'
