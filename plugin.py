@@ -1,19 +1,20 @@
 """
-<plugin key="AristonDHW" name="Ariston Water Heater" author="Based on aristonremotethermo" version="1.0.0">
+<plugin key="AristonVelis" name="Ariston Velis Water Heater" author="Based on ariston library" version="1.0.0">
     <description>
-        <h2>Ariston Water Heater Plugin</h2><br/>
-        Plugin do obsługi podgrzewaczy wody Ariston przez Domoticz<br/>
+        <h2>Ariston Velis Water Heater Plugin</h2><br/>
+        Plugin do obsługi podgrzewaczy wody Ariston Velis przez Domoticz<br/>
         <ul style="list-style-type:square">
             <li>Odczyt temperatury wody</li>
             <li>Włączanie/wyłączanie podgrzewacza</li>
-            <li>Monitoring trybu pracy DHW</li>
+            <li>Ustawianie temperatury docelowej</li>
+            <li>Monitoring trybu pracy</li>
         </ul>
     </description>
     <params>
         <param field="Username" label="Username (email)" width="200px" required="true"/>
         <param field="Password" label="Password" width="200px" required="true" password="true"/>
-        <param field="Mode1" label="Gateway ID" width="200px" required="false" default=""/>
-        <param field="Mode2" label="Update interval (seconds)" width="75px" required="true" default="60"/>
+        <param field="Mode1" label="Gateway ID (14335CF112FC)" width="200px" required="true"/>
+        <param field="Mode2" label="Update interval (seconds)" width="75px" required="true" default="180"/>
         <param field="Mode6" label="Debug" width="75px">
             <options>
                 <option label="True" value="Debug"/>
@@ -27,297 +28,358 @@
 import Domoticz
 import sys
 import os
-import logging
+import json
+import threading
+import time
 
-# Dodaj ścieżkę do biblioteki ariston
+# Dodaj ścieżkę do katalogu pluginu
 plugin_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(plugin_path)
 
-# Skonfiguruj logging dla biblioteki ariston aby przekierowywać do Domoticza
-class DomoticzLogHandler(logging.Handler):
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            if record.levelno >= logging.ERROR:
-                Domoticz.Error(f"[Ariston] {msg}")
-            elif record.levelno >= logging.WARNING:
-                Domoticz.Log(f"[Ariston WARNING] {msg}")
-            elif record.levelno >= logging.INFO:
-                Domoticz.Log(f"[Ariston] {msg}")
-            else:
-                Domoticz.Debug(f"[Ariston] {msg}")
-        except:
-            pass
-
 try:
-    from aristonremotethermo import ariston
-    # Dodaj handler do loggera biblioteki ariston
-    ariston_logger = logging.getLogger('aristonremotethermo.ariston')
-    ariston_logger.addHandler(DomoticzLogHandler())
-    ariston_logger.setLevel(logging.DEBUG)
+    import requests
 except ImportError:
-    ariston = None
+    requests = None
+
+class AristonVelisAPI:
+    """Prosta klasa do komunikacji z API Ariston Velis"""
+    
+    def __init__(self, username, password, gateway_id):
+        self.username = username
+        self.password = password
+        self.gateway_id = gateway_id
+        self.base_url = "https://www.ariston-net.remotethermo.com"
+        self.session = requests.Session()
+        self.logged_in = False
+        self.data = {}
+        
+    def login(self):
+        """Zaloguj się do API Ariston"""
+        try:
+            login_data = {
+                "email": self.username,
+                "password": self.password,
+                "rememberMe": False,
+                "language": "English_Us"
+            }
+            
+            resp = self.session.post(
+                f'{self.base_url}/R2/Account/Login?returnUrl=%2FR2%2FHome',
+                json=login_data,
+                timeout=15,
+                verify=True
+            )
+            
+            if resp.ok:
+                self.logged_in = True
+                Domoticz.Log("Logged in successfully")
+                return True
+            else:
+                Domoticz.Error(f"Login failed: {resp.status_code}")
+                return False
+                
+        except Exception as e:
+            Domoticz.Error(f"Login exception: {str(e)}")
+            return False
+    
+    def get_plant_data(self):
+        """Pobierz dane o urządzeniu"""
+        if not self.logged_in:
+            if not self.login():
+                return None
+        
+        try:
+            # Pobierz listę urządzeń Velis
+            resp = self.session.get(
+                f'{self.base_url}/api/v2/velis/plants',
+                timeout=15,
+                verify=True
+            )
+            
+            if not resp.ok:
+                Domoticz.Error(f"Failed to get plants: {resp.status_code}")
+                return None
+            
+            plants = resp.json()
+            
+            # Znajdź nasze urządzenie
+            for plant in plants:
+                if plant.get('gw') == self.gateway_id:
+                    self.data = plant
+                    Domoticz.Debug(f"Plant data: {json.dumps(plant, indent=2)}")
+                    return plant
+            
+            Domoticz.Error(f"Gateway {self.gateway_id} not found in plants")
+            return None
+            
+        except Exception as e:
+            Domoticz.Error(f"Get plant data exception: {str(e)}")
+            return None
+    
+    def get_temperature_data(self):
+        """Pobierz dane o temperaturze z menu"""
+        try:
+            # Parametry Velis z menu
+            params = [
+                "MedSetpointTemperature",  # Temperatura docelowa
+                "ProcReqTemp",  # Aktualna temperatura
+            ]
+            
+            resp = self.session.get(
+                f'{self.base_url}/R2/SlpPlantData/GetData/{self.gateway_id}',
+                timeout=15,
+                verify=True
+            )
+            
+            if resp.ok:
+                data = resp.json()
+                Domoticz.Debug(f"Temperature data: {json.dumps(data, indent=2)}")
+                return data
+            else:
+                Domoticz.Debug(f"GetData failed, trying alternative: {resp.status_code}")
+                
+                # Alternatywna metoda przez menu
+                resp = self.session.get(
+                    f'{self.base_url}/R2/PlantMenu/Refresh?id={self.gateway_id}&paramIds=MedSetpointTemperature',
+                    timeout=15
+                )
+                
+                if resp.ok:
+                    data = resp.json()
+                    Domoticz.Debug(f"Menu data: {json.dumps(data, indent=2)}")
+                    return data
+                    
+            return None
+            
+        except Exception as e:
+            Domoticz.Error(f"Get temperature data exception: {str(e)}")
+            return None
+    
+    def set_power(self, on):
+        """Włącz/wyłącz podgrzewacz"""
+        try:
+            value = 1 if on else 0
+            
+            resp = self.session.post(
+                f'{self.base_url}/api/v2/velis/slp-plant-data/{self.gateway_id}/switch',
+                json={"new": value, "old": 1 - value},
+                timeout=15
+            )
+            
+            if resp.ok:
+                Domoticz.Log(f"Power set to {'ON' if on else 'OFF'}")
+                return True
+            else:
+                Domoticz.Error(f"Set power failed: {resp.status_code}")
+                return False
+                
+        except Exception as e:
+            Domoticz.Error(f"Set power exception: {str(e)}")
+            return False
+    
+    def set_temperature(self, temp):
+        """Ustaw temperaturę docelową"""
+        try:
+            resp = self.session.post(
+                f'{self.base_url}/api/v2/velis/med-plant-data/{self.gateway_id}/temperature',
+                json={"new": temp, "old": self.data.get('reqTemp', 60)},
+                timeout=15
+            )
+            
+            if resp.ok:
+                Domoticz.Log(f"Temperature set to {temp}°C")
+                return True
+            else:
+                Domoticz.Error(f"Set temperature failed: {resp.status_code}")
+                return False
+                
+        except Exception as e:
+            Domoticz.Error(f"Set temperature exception: {str(e)}")
+            return False
+
 
 class BasePlugin:
     enabled = False
     
     def __init__(self):
-        self.ariston_handler = None
-        self.runInterval = 60
+        self.api = None
+        self.runInterval = 180
         self.heartbeat_counter = 0
+        self.update_thread = None
+        self.stop_thread = False
         
-        # Unit IDs dla urządzeń
-        self.UNIT_DHW_TEMP = 1
-        self.UNIT_DHW_SWITCH = 2
-        self.UNIT_DHW_MODE = 3
-        self.UNIT_DHW_SET_TEMP = 4
+        # Unit IDs
+        self.UNIT_TEMP_CURRENT = 1
+        self.UNIT_POWER = 2
+        self.UNIT_TEMP_TARGET = 3
+        self.UNIT_STATUS = 4
         
         return
 
     def onStart(self):
-        Domoticz.Log("Ariston Water Heater plugin started")
+        Domoticz.Log("Ariston Velis Water Heater plugin started")
         
         if Parameters["Mode6"] == "Debug":
             Domoticz.Debugging(1)
             Domoticz.Debug("Tryb debugowania włączony")
             
-        if ariston is None:
-            Domoticz.Error("Nie można zaimportować biblioteki aristonremotethermo!")
-            Domoticz.Error("Upewnij się, że folder 'aristonremotethermo' znajduje się w katalogu pluginu")
-            return
-        
-        # Sprawdź czy requests jest zainstalowany
-        try:
-            import requests
-            Domoticz.Debug(f"Moduł requests znaleziony: {requests.__version__}")
-        except ImportError:
+        if requests is None:
             Domoticz.Error("Brak modułu 'requests'! Zainstaluj: sudo pip3 install requests")
             return
-            
-        # Pobierz parametry
+        
+        # Parametry
         username = Parameters["Username"]
         password = Parameters["Password"]
-        gateway_id = Parameters["Mode1"] if Parameters["Mode1"] else ""
+        gateway_id = Parameters["Mode1"]
         
-        if not username or not password:
-            Domoticz.Error("Username i Password są wymagane!")
+        if not username or not password or not gateway_id:
+            Domoticz.Error("Username, Password i Gateway ID są wymagane!")
             return
-        
-        Domoticz.Debug(f"Username: {username}")
-        Domoticz.Debug(f"Gateway ID: {gateway_id if gateway_id else 'Auto-detect'}")
         
         try:
             self.runInterval = int(Parameters["Mode2"])
-            if self.runInterval < 30:
-                self.runInterval = 30
-                Domoticz.Log(f"Minimalny interwał to 30 sekund, ustawiono: {self.runInterval}")
+            if self.runInterval < 60:
+                self.runInterval = 60
         except:
-            self.runInterval = 60
+            self.runInterval = 180
             
-        Domoticz.Heartbeat(10)  # Co 10 sekund sprawdzamy
+        Domoticz.Heartbeat(10)
         
-        # Utwórz urządzenia jeśli nie istnieją
-        if self.UNIT_DHW_TEMP not in Devices:
-            Domoticz.Device(Name="DHW Temperature", Unit=self.UNIT_DHW_TEMP, 
+        # Utwórz urządzenia
+        if self.UNIT_TEMP_CURRENT not in Devices:
+            Domoticz.Device(Name="Temperatura aktualna", Unit=self.UNIT_TEMP_CURRENT, 
                           TypeName="Temperature", Used=1).Create()
-            Domoticz.Log("Utworzono urządzenie: DHW Temperature")
             
-        if self.UNIT_DHW_SWITCH not in Devices:
-            Domoticz.Device(Name="DHW Power", Unit=self.UNIT_DHW_SWITCH, 
+        if self.UNIT_POWER not in Devices:
+            Domoticz.Device(Name="Zasilanie", Unit=self.UNIT_POWER, 
                           TypeName="Switch", Switchtype=0, Used=1).Create()
-            Domoticz.Log("Utworzono urządzenie: DHW Power")
             
-        if self.UNIT_DHW_MODE not in Devices:
-            Domoticz.Device(Name="DHW Mode", Unit=self.UNIT_DHW_MODE, 
-                          TypeName="Text", Used=1).Create()
-            Domoticz.Log("Utworzono urządzenie: DHW Mode")
-            
-        if self.UNIT_DHW_SET_TEMP not in Devices:
-            Domoticz.Device(Name="DHW Set Temperature", Unit=self.UNIT_DHW_SET_TEMP, 
+        if self.UNIT_TEMP_TARGET not in Devices:
+            Domoticz.Device(Name="Temperatura docelowa", Unit=self.UNIT_TEMP_TARGET, 
                           Type=242, Subtype=1, Used=1).Create()
-            Domoticz.Log("Utworzono urządzenie: DHW Set Temperature")
+            
+        if self.UNIT_STATUS not in Devices:
+            Domoticz.Device(Name="Status", Unit=self.UNIT_STATUS, 
+                          TypeName="Text", Used=1).Create()
         
-        # Inicjalizuj handler Ariston
-        try:
-            sensors_list = [
-                'dhw_set_temperature',
-                'dhw_storage_temperature',
-                'dhw_mode',
-                'mode'
-            ]
-            
-            Domoticz.Log(f"Inicjalizacja handlera z interwałem {self.runInterval}s")
-            Domoticz.Log(f"Gateway ID: '{gateway_id}'")
-            
-            # Ustaw poziom logowania dla biblioteki ariston
-            log_level = 'DEBUG' if Parameters["Mode6"] == "Debug" else 'INFO'
-            
-            self.ariston_handler = ariston.AristonHandler(
-                username=username,
-                password=password,
-                sensors=sensors_list,
-                logging_level=log_level,
-                period_get_request=self.runInterval,
-                gw=gateway_id
-            )
-            
-            Domoticz.Log("Handler utworzony, subskrybowanie callbacków...")
-            
-            # Subskrybuj zmiany
-            self.ariston_handler.subscribe_sensors(self.sensor_update_callback)
-            self.ariston_handler.subscribe_statuses(self.status_update_callback)
-            
-            Domoticz.Log("Uruchamianie handlera...")
-            
-            # Uruchom handler
-            self.ariston_handler.start()
-            Domoticz.Log("Handler Ariston został uruchomiony - oczekiwanie na połączenie...")
-            Domoticz.Log("Pierwsze dane powinny pojawić się w ciągu 60 sekund")
-            
-        except Exception as e:
-            Domoticz.Error(f"Błąd podczas inicjalizacji handlera: {str(e)}")
-            import traceback
-            Domoticz.Error(f"Traceback: {traceback.format_exc()}")
-            self.ariston_handler = None
+        # Inicjalizuj API
+        self.api = AristonVelisAPI(username, password, gateway_id)
+        
+        Domoticz.Log(f"Plugin skonfigurowany dla gateway {gateway_id}, interwał: {self.runInterval}s")
+        
+        # Uruchom wątek aktualizacji
+        self.stop_thread = False
+        self.update_thread = threading.Thread(target=self.update_loop)
+        self.update_thread.daemon = True
+        self.update_thread.start()
 
     def onStop(self):
-        Domoticz.Log("Ariston Water Heater plugin stopped")
-        if self.ariston_handler:
-            try:
-                self.ariston_handler.stop()
-            except:
-                pass
-
-    def onConnect(self, Connection, Status, Description):
-        pass
-
-    def onMessage(self, Connection, Data):
-        pass
+        Domoticz.Log("Ariston Velis plugin stopped")
+        self.stop_thread = True
+        if self.update_thread:
+            self.update_thread.join(timeout=5)
 
     def onCommand(self, Unit, Command, Level, Hue):
-        Domoticz.Debug(f"onCommand called for Unit {Unit}: Command '{Command}', Level: {Level}")
+        Domoticz.Debug(f"onCommand: Unit={Unit}, Command={Command}, Level={Level}")
         
-        if not self.ariston_handler:
-            Domoticz.Error("Handler Ariston nie jest zainicjalizowany")
+        if not self.api:
             return
             
         try:
-            if Unit == self.UNIT_DHW_SWITCH:
-                # Włączanie/wyłączanie DHW
+            if Unit == self.UNIT_POWER:
                 if Command == "On":
-                    self.ariston_handler.set_http_data(mode="Summer")
-                    Devices[Unit].Update(nValue=1, sValue="On")
-                    Domoticz.Log("DHW włączony (tryb Summer)")
+                    if self.api.set_power(True):
+                        Devices[Unit].Update(nValue=1, sValue="On")
                 elif Command == "Off":
-                    self.ariston_handler.set_http_data(mode="OFF")
-                    Devices[Unit].Update(nValue=0, sValue="Off")
-                    Domoticz.Log("DHW wyłączony")
-                    
-            elif Unit == self.UNIT_DHW_SET_TEMP:
-                # Ustawianie temperatury
+                    if self.api.set_power(False):
+                        Devices[Unit].Update(nValue=0, sValue="Off")
+                        
+            elif Unit == self.UNIT_TEMP_TARGET:
                 try:
-                    temp_value = float(Level)
-                    self.ariston_handler.set_http_data(dhw_set_temperature=temp_value)
-                    Devices[Unit].Update(nValue=0, sValue=str(temp_value))
-                    Domoticz.Log(f"Ustawiono temperaturę DHW na: {temp_value}°C")
+                    temp = float(Level)
+                    if 40 <= temp <= 80:  # Zakres typowy dla Velis
+                        if self.api.set_temperature(temp):
+                            Devices[Unit].Update(nValue=0, sValue=str(temp))
+                    else:
+                        Domoticz.Error(f"Temperatura {temp} poza zakresem 40-80°C")
                 except ValueError:
                     Domoticz.Error(f"Nieprawidłowa wartość temperatury: {Level}")
                     
         except Exception as e:
-            Domoticz.Error(f"Błąd podczas wykonywania komendy: {str(e)}")
-
-    def onNotification(self, Name, Subject, Text, Status, Priority, Sound, ImageFile):
-        pass
-
-    def onDisconnect(self, Connection):
-        pass
+            Domoticz.Error(f"Błąd wykonywania komendy: {str(e)}")
 
     def onHeartbeat(self):
         self.heartbeat_counter += 1
+        # Heartbeat co 10s, ale aktualizacja jest w osobnym wątku
+
+    def update_loop(self):
+        """Główna pętla aktualizacji danych"""
+        Domoticz.Log("Update loop started")
         
-        # Co 10 cykli heartbeat sprawdź status (100 sekund)
-        if self.heartbeat_counter >= 10:
-            self.heartbeat_counter = 0
-            if self.ariston_handler:
-                try:
-                    available = self.ariston_handler.available
-                    dhw_available = self.ariston_handler.dhw_available
-                    
-                    Domoticz.Debug(f"Status check - Available: {available}, DHW: {dhw_available}")
-                    
-                    if not available:
-                        Domoticz.Error("Połączenie z Ariston niedostępne")
-                        Domoticz.Debug(f"Plant ID: {self.ariston_handler.plant_id}")
-                        
-                        # Sprawdź czy są dane
-                        sensor_values = self.ariston_handler.sensor_values
-                        Domoticz.Debug(f"Liczba sensorów z danymi: {len([k for k,v in sensor_values.items() if v.get('value') is not None])}")
-                    else:
-                        Domoticz.Debug("Połączenie aktywne")
-                        
-                except Exception as e:
-                    Domoticz.Error(f"Błąd podczas sprawdzania statusu: {str(e)}")
-            else:
-                Domoticz.Error("Handler Ariston nie jest zainicjalizowany")
-
-    def sensor_update_callback(self, changed_data, *args, **kwargs):
-        """Callback wywoływany gdy zmieniają się wartości sensorów"""
+        while not self.stop_thread:
+            try:
+                self.update_data()
+            except Exception as e:
+                Domoticz.Error(f"Update loop error: {str(e)}")
+            
+            # Czekaj z możliwością przerwania
+            for _ in range(self.runInterval):
+                if self.stop_thread:
+                    break
+                time.sleep(1)
+        
+        Domoticz.Log("Update loop stopped")
+    
+    def update_data(self):
+        """Pobierz i zaktualizuj dane z API"""
+        if not self.api:
+            return
+        
         try:
-            Domoticz.Debug(f"Sensor update: {list(changed_data.keys())}")
+            # Pobierz dane podstawowe
+            plant_data = self.api.get_plant_data()
+            if not plant_data:
+                Devices[self.UNIT_STATUS].Update(nValue=0, sValue="Offline")
+                return
             
-            # Aktualizuj temperaturę wody
-            if 'dhw_storage_temperature' in changed_data:
-                temp = changed_data['dhw_storage_temperature'].get('value')
-                if temp is not None:
-                    Devices[self.UNIT_DHW_TEMP].Update(nValue=0, sValue=str(temp))
-                    Domoticz.Debug(f"Zaktualizowano temperaturę DHW: {temp}°C")
+            # Pobierz dane o temperaturze
+            temp_data = self.api.get_temperature_data()
             
-            # Aktualizuj temperaturę nastawioną
-            if 'dhw_set_temperature' in changed_data:
-                temp = changed_data['dhw_set_temperature'].get('value')
-                if temp is not None:
-                    Devices[self.UNIT_DHW_SET_TEMP].Update(nValue=0, sValue=str(temp))
-                    Domoticz.Debug(f"Zaktualizowano nastawę temperatury DHW: {temp}°C")
+            # Zaktualizuj status
+            is_online = not plant_data.get('isOffline48H', True)
+            link_status = plant_data.get('lnk', 0)
             
-            # Aktualizuj tryb DHW
-            if 'dhw_mode' in changed_data:
-                mode = changed_data['dhw_mode'].get('value')
-                if mode is not None:
-                    Devices[self.UNIT_DHW_MODE].Update(nValue=0, sValue=str(mode))
-                    Domoticz.Debug(f"Zaktualizowano tryb DHW: {mode}")
+            status_text = "Online" if is_online and link_status == 1 else "Offline"
+            Devices[self.UNIT_STATUS].Update(nValue=0, sValue=status_text)
             
-            # Aktualizuj przełącznik na podstawie trybu głównego
-            if 'mode' in changed_data:
-                mode = changed_data['mode'].get('value')
-                if mode is not None:
-                    if mode == "OFF":
-                        Devices[self.UNIT_DHW_SWITCH].Update(nValue=0, sValue="Off")
-                    else:
-                        Devices[self.UNIT_DHW_SWITCH].Update(nValue=1, sValue="On")
-                    Domoticz.Debug(f"Zaktualizowano stan przełącznika: {mode}")
-                    
+            # Zaktualizuj dane jeśli dostępne
+            if temp_data and isinstance(temp_data, dict):
+                # Próbuj różne klucze dla temperatury
+                current_temp = None
+                target_temp = None
+                
+                if 'data' in temp_data:
+                    for item in temp_data['data']:
+                        if 'MedSetpointTemperature' in item.get('id', ''):
+                            target_temp = item.get('value')
+                        elif 'ProcReqTemp' in item.get('id', ''):
+                            current_temp = item.get('value')
+                
+                if current_temp is not None:
+                    Devices[self.UNIT_TEMP_CURRENT].Update(nValue=0, sValue=str(current_temp))
+                    Domoticz.Debug(f"Aktualna temperatura: {current_temp}°C")
+                
+                if target_temp is not None:
+                    Devices[self.UNIT_TEMP_TARGET].Update(nValue=0, sValue=str(target_temp))
+                    Domoticz.Debug(f"Temperatura docelowa: {target_temp}°C")
+            
+            Domoticz.Debug("Data updated successfully")
+            
         except Exception as e:
-            Domoticz.Error(f"Błąd w callback aktualizacji sensorów: {str(e)}")
+            Domoticz.Error(f"Update data error: {str(e)}")
+            import traceback
+            Domoticz.Error(traceback.format_exc())
 
-    def status_update_callback(self, changed_status, *args, **kwargs):
-        """Callback wywoływany gdy zmienia się status połączenia"""
-        try:
-            Domoticz.Debug(f"Status update: {changed_status}")
-            
-            if 'available' in changed_status:
-                if changed_status['available']:
-                    Domoticz.Log("Połączenie z Ariston aktywne")
-                else:
-                    Domoticz.Error("Połączenie z Ariston nieaktywne")
-                    
-            if 'dhw_available' in changed_status:
-                if changed_status['dhw_available']:
-                    Domoticz.Log("DHW dostępny")
-                else:
-                    Domoticz.Log("DHW niedostępny")
-                    
-        except Exception as e:
-            Domoticz.Error(f"Błąd w callback aktualizacji statusu: {str(e)}")
 
 global _plugin
 _plugin = BasePlugin()
@@ -330,25 +392,9 @@ def onStop():
     global _plugin
     _plugin.onStop()
 
-def onConnect(Connection, Status, Description):
-    global _plugin
-    _plugin.onConnect(Connection, Status, Description)
-
-def onMessage(Connection, Data):
-    global _plugin
-    _plugin.onMessage(Connection, Data)
-
 def onCommand(Unit, Command, Level, Hue):
     global _plugin
     _plugin.onCommand(Unit, Command, Level, Hue)
-
-def onNotification(Name, Subject, Text, Status, Priority, Sound, ImageFile):
-    global _plugin
-    _plugin.onNotification(Name, Subject, Text, Status, Priority, Sound, ImageFile)
-
-def onDisconnect(Connection):
-    global _plugin
-    _plugin.onDisconnect(Connection)
 
 def onHeartbeat():
     global _plugin
